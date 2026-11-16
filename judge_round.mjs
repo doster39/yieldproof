@@ -20,7 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ADDR = "0x34747A848366656bDDdFefc6fDCf1cD6c917f9b8";
+const ADDR = "0x00b3ef8e9D3F0e57f5C63345202fCb8ae8dc801d";
 const SDIG = "sha256:disclosure-2f9a1c7b";
 const MDIG = "sha256:methodology-77be0d31";
 const VAULT = "blueharbor";

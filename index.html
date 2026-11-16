@@ -116,7 +116,7 @@
 
 <main>
   <section class="hero">
-    <div class="tag">build 11-01-yieldproof · chain 61999</div>
+    <div class="tag">build 11-02-reserved · chain 61999</div>
     <h2>A vault can advertise any yield it likes. This makes the number challengeable.</h2>
     <p>
       A vault operator registers and posts a bond, then commits each reporting period on chain:
@@ -241,16 +241,19 @@
         the vault whose report lost.</li>
       <li><b>record_report</b> — operator only. Binds the period, the claimed APY, the disclosure
         URL and both digests. There is no report, so there is nothing to challenge.</li>
-      <li><b>challenge_report</b> — stake GEN and give a reason. The operator cannot challenge
+      <li><b>challenge_report</b> — stake GEN and give a reason. <b>The bounty is reserved out of
+        the vault's bond the moment the challenge opens</b>, not when it is judged, so a bond can
+        only back as many open bounties as it can actually pay, and the operator cannot withdraw
+        that amount for the whole life of the challenge. The operator cannot challenge
         themselves, and each report can be challenged exactly once.</li>
       <li><b>judge_challenge</b> — the jury reads the committed URL, extracts the stated figure and
         whether the page explains its method, and the contract derives the outcome with
         <code>|stated − claimed| × 10000 ≤ tolerance × claimed</code>. Every validator re-reads the
         page and re-derives independently; a leader whose echoed outcome disagrees with its own
         numbers is rejected outright.</li>
-      <li><b>settle_challenge</b> — once. Unsupported: stake returned plus the bounty out of the
-        bond. Supported: the stake is forfeited into the bond. Inconclusive: stake returned,
-        nothing slashed. Unfunded bounty: stake returned.</li>
+      <li><b>settle_challenge</b> — once. Unsupported: the reserved bounty is paid out with the
+        stake. Supported: the reservation is released and the stake is forfeited into the bond.
+        Inconclusive: the reservation is released and the stake returned, nothing slashed.</li>
       <li><b>reclaim_stake</b> — the challenger always gets out: immediately when the bounty could
         not be paid, or once a challenge has sat unjudged past the 7-day window.</li>
     </ol>
@@ -275,7 +278,7 @@ import { createClient } from "https://esm.sh/genlayer-js@1.1.8";
 import { studionet } from "https://esm.sh/genlayer-js@1.1.8/chains";
 
 // ------------------------------------------------------------------------ config
-const ADDR = "0x34747A848366656bDDdFefc6fDCf1cD6c917f9b8";
+const ADDR = "0x00b3ef8e9D3F0e57f5C63345202fCb8ae8dc801d";
 const EXPLORER = "https://explorer-studio.genlayer.com/address/" + ADDR;
 const CSTATE = ["OPEN", "SUPPORTED", "UNSUPPORTED", "INCONCLUSIVE", "SETTLED", "UNFUNDED", "RELEASED"];
 const $ = (id) => document.getElementById(id);
@@ -563,9 +566,10 @@ $("challengeBtn").addEventListener("click", () => {
       if (String(rep.operator).toLowerCase() === String(myAddr).toLowerCase())
         return msg($("cMsg"), "You are the operator of this vault — you cannot challenge your own report.", "err");
       const v = await readClient.readContract({ address: ADDR, functionName: "get_vault", args: [rep.vault_id] });
-      if (BigInt(v.bond) < b) return msg($("cMsg"), "That vault's bond is smaller than the bounty you asked for.", "err");
-      if (BigInt(v.withdrawable) < b && BigInt(v.committed) > 0n)
-        msg($("cMsg"), "Note: most of this vault's bond is already committed — your bounty may settle as UNFUNDED and simply return your stake.", "info");
+      // The bounty is reserved the moment the challenge opens, so it must fit inside
+      // the part of the bond that is not already promised to another open challenge.
+      if (BigInt(v.withdrawable) < b)
+        return msg($("cMsg"), `This vault can only back ${eth(v.withdrawable)} GEN in new bounties right now — the rest is reserved for open challenges. Lower the bounty.`, "err");
     } catch (e) {
       return msg($("cMsg"), "Could not read that report: " + walletErr(e).slice(0, 160), "err");
     }
