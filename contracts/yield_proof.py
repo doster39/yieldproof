@@ -1,5 +1,23 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
+# YieldProof - a challenge market over yield disclosures.
+#
+# The operator commits a report (period, claimed APY, disclosure URL, and digests of
+# the disclosure and the methodology), then anyone may challenge it by staking GEN.
+# The jury re-reads the URL the OPERATOR committed - a challenge takes no URL - and
+# the contract derives the outcome with one shared rule (_derive): outside tolerance
+# is unsupported, within tolerance without a method is unsupported, within tolerance
+# with a method is supported, an unreadable page is inconclusive so nothing is
+# slashed. Every validator re-fetches and re-derives independently.
+#
+# MONEY INVARIANT. A challenge's bounty is reserved the moment the challenge opens
+# (_reserve), not when it is judged. So a bond can only back as many open bounties
+# as it can actually pay, and the reserved amount is excluded from withdraw_bond for
+# the whole life of the challenge. Judging reserves nothing new; settle either pays
+# the reservation to the challenger or releases it (_release), and reclaim_stake
+# releases it if the challenge times out. committed is therefore always <= bond, and
+# every reservation is accounted for exactly once.
+
 import json
 import datetime
 from dataclasses import dataclass
@@ -131,6 +149,28 @@ class YieldProof(gl.Contract):
     def _uncommitted(self, v) -> int:
         left = int(v.bond) - int(v.committed)
         return left if left > 0 else 0
+
+    def _reserve(self, vault_id: str, amount: int):
+        """Atomically set aside a bounty when a challenge opens.
+
+        Reserving at open time is what makes concurrent challenges safe: the bond
+        can only back as many open bounties as it can actually pay, so the operator
+        can never have more outstanding promises than funds. The reserved amount is
+        excluded from withdraw_bond for the whole life of the challenge.
+        """
+        v = self._vault(vault_id)
+        if self._uncommitted(v) < amount:
+            raise gl.vm.UserError("Vault bond cannot back this bounty")
+        v.committed = v.committed + u256(amount)
+        self.vaults[vault_id.strip().lower()] = v
+
+    def _release(self, vault_id: str, amount: int):
+        """Give a reserved bounty back to the withdrawable side of the bond."""
+        v = self._vault(vault_id)
+        had = int(v.committed)
+        left = had - amount
+        v.committed = u256(left if left > 0 else 0)
+        self.vaults[vault_id.strip().lower()] = v
 
     def _within(self, claimed: int, stated: int, tolerance_bps: int) -> bool:
         if claimed < 0 or stated < 0:
@@ -352,9 +392,10 @@ class YieldProof(gl.Contract):
             raise gl.vm.UserError("Bounty over maximum")
         if b > int(stake) * BOUNTY_TO_STAKE_CAP:
             raise gl.vm.UserError("Bounty over 100x stake")
-        v = self._vault(r.vault_id)
-        if int(v.bond) < b:
-            raise gl.vm.UserError("Vault bond cannot back this bounty")
+        # Reserve the bounty now, not at judgment time. Two open challenges can no
+        # longer both promise the same GEN: the second is refused instead of being
+        # accepted and silently downgraded to UNFUNDED later.
+        self._reserve(r.vault_id, b)
 
         cid = self.next_challenge
         self.next_challenge = u256(int(cid) + 1)
@@ -555,13 +596,9 @@ class YieldProof(gl.Contract):
         c.verdict_reason = str(result.get("reason", ""))
         c.confidence = str(result.get("confidence", ""))
         c.state = u8(derived)
-
-        if derived == S_UNSUPPORTED:
-            if self._uncommitted(v) >= int(c.bounty):
-                v.committed = v.committed + c.bounty
-                self.vaults[c.vault_id] = v
-            else:
-                c.state = u8(S_UNFUNDED)
+        # The bounty was reserved the moment this challenge opened, so judgment
+        # reserves nothing new and moves no money. It stays locked and unavailable
+        # to withdraw_bond until settle releases or pays it.
         self.challenges[challenge_id] = c
 
     @gl.public.write
@@ -572,8 +609,12 @@ class YieldProof(gl.Contract):
             raise gl.vm.UserError("Not judged yet")
         if bool(c.stake_settled):
             raise gl.vm.UserError("Already settled")
+        bounty = int(c.bounty)
 
         if st == S_SUPPORTED:
+            # The claim held up: nothing is owed on the bounty, so release the
+            # reservation, and the challenger's stake is forfeited into the bond.
+            self._release(c.vault_id, bounty)
             v = self._vault(c.vault_id)
             v.bond = v.bond + c.stake
             self.vaults[c.vault_id] = v
@@ -582,14 +623,10 @@ class YieldProof(gl.Contract):
             self.challenges[challenge_id] = c
             return
 
-        if st == S_INCONCLUSIVE:
-            c.stake_settled = True
-            c.state = u8(S_SETTLED)
-            self.challenges[challenge_id] = c
-            self._pay(self._to_addr(c.challenger), c.stake)
-            return
-
-        if st == S_UNFUNDED:
+        if st == S_INCONCLUSIVE or st == S_UNFUNDED:
+            # Nothing is slashed and nothing is paid out: release the reservation
+            # and hand the stake back.
+            self._release(c.vault_id, bounty)
             c.stake_settled = True
             c.state = u8(S_SETTLED)
             self.challenges[challenge_id] = c
@@ -599,16 +636,16 @@ class YieldProof(gl.Contract):
         if st != S_UNSUPPORTED:
             raise gl.vm.UserError("Nothing to settle")
 
+        # The claim did not hold: the reserved bounty leaves the bond along with the
+        # challenger's stake. Release first so the accounting nets out exactly once.
+        self._release(c.vault_id, bounty)
         v = self._vault(c.vault_id)
-        payout = c.stake + c.bounty
-        if int(v.committed) >= int(c.bounty):
-            v.committed = v.committed - c.bounty
-        v.bond = v.bond - c.bounty
+        v.bond = v.bond - u256(bounty)
         self.vaults[c.vault_id] = v
         c.stake_settled = True
         c.state = u8(S_SETTLED)
         self.challenges[challenge_id] = c
-        self._pay(self._to_addr(c.challenger), u256(int(payout)))
+        self._pay(self._to_addr(c.challenger), u256(int(c.stake) + bounty))
 
     @gl.public.write
     def reclaim_stake(self, challenge_id: u256):
@@ -617,6 +654,7 @@ class YieldProof(gl.Contract):
             raise gl.vm.UserError("Already settled")
         st = int(c.state)
         if st == S_UNFUNDED:
+            self._release(c.vault_id, int(c.bounty))
             c.stake_settled = True
             c.state = u8(S_SETTLED)
             self.challenges[challenge_id] = c
@@ -626,6 +664,9 @@ class YieldProof(gl.Contract):
             raise gl.vm.UserError("Outcome already decided")
         if self._now() - int(c.opened_at) < JUDGE_TIMEOUT_SECS:
             raise gl.vm.UserError("Judge window still open")
+        # An unjudged challenge releases its reservation too, or the bounty would
+        # stay locked against the bond forever.
+        self._release(c.vault_id, int(c.bounty))
         c.stake_settled = True
         c.state = u8(S_RELEASED)
         self.challenges[challenge_id] = c
