@@ -418,7 +418,8 @@ def test_judge_finds_a_supported_claim(direct_vm, direct_deploy, direct_alice, d
     ch = c.get_challenge(cid)
     assert int(ch["state"]) == 1          # S_SUPPORTED
     assert int(ch["stated_apy_bps"]) == CLAIM
-    assert int(c.get_vault(VAULT)["committed"]) == 0
+    # the bounty stays reserved after judgment; only settle releases it
+    assert int(c.get_vault(VAULT)["committed"]) == BOUNTY
 
 
 def test_judge_accepts_a_figure_inside_tolerance(direct_vm, direct_deploy,
@@ -455,7 +456,8 @@ def test_judge_is_inconclusive_when_the_page_is_unreadable(direct_vm, direct_dep
     c.judge_challenge(cid)
     ch = c.get_challenge(cid)
     assert int(ch["state"]) == 3          # S_INCONCLUSIVE
-    assert int(c.get_vault(VAULT)["committed"]) == 0
+    # reserved since the challenge opened, released on settle
+    assert int(c.get_vault(VAULT)["committed"]) == BOUNTY
 
 
 def test_judge_is_inconclusive_when_no_figure_is_stated(direct_vm, direct_deploy,
@@ -534,7 +536,8 @@ def test_a_leader_must_echo_a_state_its_own_numbers_support(direct_vm, direct_de
     with direct_vm.expect_revert("contradicts its own numbers"):
         c.judge_challenge(cid)
     assert int(c.get_challenge(cid)["state"]) == 0
-    assert int(c.get_vault(VAULT)["committed"]) == 0
+    # the revert restores the pre-call state, which already had the bounty reserved
+    assert int(c.get_vault(VAULT)["committed"]) == BOUNTY
 
 
 def test_malformed_leader_payload_is_refused(direct_vm, direct_deploy,
@@ -671,25 +674,32 @@ def test_reclaim_before_the_window_reverts(direct_vm, direct_deploy, direct_alic
         c.reclaim_stake(cid)
 
 
-def test_a_second_challenge_goes_unfunded_once_the_bond_is_committed(
-        direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
-    """The bond backs the first committed bounty; a second cannot also be paid."""
+def test_a_second_challenge_cannot_overbook_the_bond(direct_vm, direct_deploy,
+                                                     direct_alice, direct_bob,
+                                                     direct_charlie):
+    """The bond backs as many open bounties as it can pay, and no more.
+
+    Because the bounty is reserved when the challenge opens, a second challenger
+    asking for more than the leftover bond is refused outright rather than being
+    accepted and quietly downgraded to UNFUNDED at judgment.
+    """
     c = _setup(direct_vm, direct_deploy, direct_alice)
-    _bond(direct_vm, c, direct_alice, BOUNTY)          # bond == exactly one bounty
+    _bond(direct_vm, c, direct_alice, BOUNTY)          # exactly one bounty's worth
     r1 = _report(direct_vm, c, direct_alice)
     r2 = _report(direct_vm, c, direct_alice, period="2026-Q4")
     c1 = _challenge(direct_vm, c, direct_bob, r1)
-    _mock(direct_vm, stated=1600)
-    c.judge_challenge(c1)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == BOUNTY               # reserved immediately
+    assert int(v["withdrawable"]) == 0
+
+    direct_vm.sender = direct_charlie
+    direct_vm.value = STAKE
+    with direct_vm.expect_revert("bond cannot back"):
+        c.challenge_report(r2, NOTE, BOUNTY)
+    direct_vm.value = 0
+    # the first challenge is untouched and still open
+    assert int(c.get_challenge(c1)["state"]) == 0
     assert int(c.get_vault(VAULT)["committed"]) == BOUNTY
-    c2 = _challenge(direct_vm, c, direct_charlie, r2)
-    c.judge_challenge(c2)
-    assert int(c.get_challenge(c1)["state"]) == 2      # first: unsupported
-    assert int(c.get_challenge(c2)["state"]) == 5      # second: UNFUNDED
-    # the unfunded challenger simply gets the stake back
-    c.settle_challenge(c2)
-    assert int(c.get_challenge(c2)["state"]) == 4
-    assert c.get_challenge(c2)["stake_settled"] is True
 
 
 def test_a_settled_challenge_cannot_be_reclaimed(direct_vm, direct_deploy,
@@ -775,3 +785,138 @@ def test_counts_track_reports_and_challenges(direct_vm, direct_deploy,
     counts = c.get_counts()
     assert int(counts["report_count"]) == 1
     assert int(counts["challenge_count"]) == 1
+
+
+# ------------------------------------- bounty reservation (steward round 2) --
+
+def test_bounty_is_reserved_when_the_challenge_opens(direct_vm, direct_deploy,
+                                                     direct_alice, direct_bob):
+    """Reservation happens at open, not at judgment."""
+    c = _setup(direct_vm, direct_deploy, direct_alice)
+    _bond(direct_vm, c, direct_alice, BOND)
+    rid = _report(direct_vm, c, direct_alice)
+    assert int(c.get_vault(VAULT)["committed"]) == 0
+    _challenge(direct_vm, c, direct_bob, rid)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == BOUNTY
+    assert int(v["withdrawable"]) == BOND - BOUNTY
+
+
+def test_withdrawal_is_blocked_between_challenge_and_judgment(direct_vm, direct_deploy,
+                                                              direct_alice, direct_bob):
+    """The case the reviewer named: no withdrawal while a challenge is open.
+
+    Between challenge creation and judgment the operator must not be able to pull
+    the reserved bounty out from under the challenger.
+    """
+    c, cid = _ready(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    v = c.get_vault(VAULT)
+    assert int(c.get_challenge(cid)["state"]) == 0        # still OPEN, unjudged
+    assert int(v["committed"]) == BOUNTY
+    assert int(v["withdrawable"]) == BOND - BOUNTY
+
+    direct_vm.sender = direct_alice
+    # the whole bond, and even one wei more than the free part, are both refused
+    with direct_vm.expect_revert("Committed bounty is protected"):
+        c.withdraw_bond(VAULT, BOND, _hex(direct_alice))
+    with direct_vm.expect_revert("Committed bounty is protected"):
+        c.withdraw_bond(VAULT, BOND - BOUNTY + 1, _hex(direct_alice))
+
+    # exactly the uncommitted part still moves
+    c.withdraw_bond(VAULT, BOND - BOUNTY, _hex(direct_alice))
+    v = c.get_vault(VAULT)
+    assert int(v["bond"]) == BOUNTY
+    assert int(v["withdrawable"]) == 0
+
+    # and the promise is still fully payable afterwards
+    _mock(direct_vm, stated=1600)
+    c.judge_challenge(cid)
+    c.settle_challenge(cid)
+    assert int(c.get_challenge(cid)["state"]) == 4
+    assert c.get_challenge(cid)["stake_settled"] is True
+    assert int(c.get_vault(VAULT)["bond"]) == 0
+
+
+def test_withdrawal_is_blocked_after_judgment_until_settlement(direct_vm, direct_deploy,
+                                                               direct_alice, direct_bob):
+    """A judged but unsettled challenge still holds its reservation."""
+    c, cid = _ready(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _mock(direct_vm, stated=1600)
+    c.judge_challenge(cid)
+    assert int(c.get_challenge(cid)["state"]) == 2        # UNSUPPORTED, not settled
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == BOUNTY
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Committed bounty is protected"):
+        c.withdraw_bond(VAULT, BOND, _hex(direct_alice))
+
+
+def test_reservation_is_released_when_the_claim_holds(direct_vm, direct_deploy,
+                                                      direct_alice, direct_bob):
+    c, cid = _ready(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _mock(direct_vm)                                      # claim holds -> SUPPORTED
+    c.judge_challenge(cid)
+    c.settle_challenge(cid)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == 0                       # released
+    assert int(v["bond"]) == BOND + STAKE                 # stake forfeited in
+
+
+def test_reservation_is_consumed_when_the_claim_fails(direct_vm, direct_deploy,
+                                                      direct_alice, direct_bob):
+    c, cid = _ready(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _mock(direct_vm, stated=1600)                         # claim fails -> UNSUPPORTED
+    c.judge_challenge(cid)
+    c.settle_challenge(cid)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == 0                       # released
+    assert int(v["bond"]) == BOND - BOUNTY                # bounty paid out
+
+
+def test_reservation_is_released_on_an_inconclusive_reading(direct_vm, direct_deploy,
+                                                            direct_alice, direct_bob):
+    c, cid = _ready(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _mock(direct_vm, body="tiny")                         # INCONCLUSIVE
+    c.judge_challenge(cid)
+    c.settle_challenge(cid)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == 0
+    assert int(v["bond"]) == BOND                         # untouched
+
+
+def test_reservations_stack_across_reports(direct_vm, direct_deploy, direct_alice,
+                                           direct_bob, direct_charlie):
+    """Two open challenges reserve two bounties and both can be paid."""
+    c = _setup(direct_vm, direct_deploy, direct_alice)
+    _bond(direct_vm, c, direct_alice, BOND)               # room for many bounties
+    r1 = _report(direct_vm, c, direct_alice)
+    r2 = _report(direct_vm, c, direct_alice, period="2026-Q4")
+    c1 = _challenge(direct_vm, c, direct_bob, r1)
+    c2 = _challenge(direct_vm, c, direct_charlie, r2)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == 2 * BOUNTY
+    assert int(v["withdrawable"]) == BOND - 2 * BOUNTY
+    _mock(direct_vm, stated=1600)
+    c.judge_challenge(c1)
+    c.settle_challenge(c1)
+    c.judge_challenge(c2)
+    c.settle_challenge(c2)
+    v = c.get_vault(VAULT)
+    assert int(v["committed"]) == 0
+    assert int(v["bond"]) == BOND - 2 * BOUNTY
+
+
+def test_a_reservation_in_one_vault_never_touches_another(direct_vm, direct_deploy,
+                                                          direct_alice, direct_bob,
+                                                          direct_charlie):
+    c = _setup(direct_vm, direct_deploy, direct_alice)
+    direct_vm.sender = direct_charlie
+    c.register_vault("othervault", TOL)
+    _bond(direct_vm, c, direct_alice, BOND)
+    _bond(direct_vm, c, direct_charlie, BOND, vault="othervault")
+    rid = _report(direct_vm, c, direct_alice)
+    _challenge(direct_vm, c, direct_bob, rid)
+    assert int(c.get_vault(VAULT)["committed"]) == BOUNTY
+    assert int(c.get_vault("othervault")["committed"]) == 0
+    assert int(c.get_vault("othervault")["withdrawable"]) == BOND
